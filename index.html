@@ -876,6 +876,23 @@ section{padding:6rem 5rem}
   padding:1rem;
 }
 .order-followup-card.show{display:grid;gap:0.85rem}
+
+/* Cart states: checkout fields appear only when the cart has items. */
+.cart-panel.post-order .cart-table-info,
+.cart-panel.post-order #cartItems,
+.cart-panel.post-order #cartEmpty,
+.cart-panel.post-order #cartSummary{
+  display:none !important;
+}
+.checkout-form.followup-mode > :not(#orderFollowup){
+  display:none !important;
+}
+.cart-panel.post-order .checkout-form{
+  margin-top:1rem;
+}
+.cart-panel.post-order .order-followup-card{
+  margin-top:0;
+}
 .followup-kicker{
   color:var(--neon);
   font-size:0.67rem;
@@ -1602,7 +1619,7 @@ footer p{font-size:0.78rem;color:var(--text-muted)}
   <div class="menu-controls-sticky" aria-label="Menu controls">
     <div class="tabs" id="menuTabs"></div>
     <div class="menu-search-row">
-      <input class="menu-search-input" id="menuSearch" type="search" placeholder="Search latte, mocha, caramel, biscoff...">
+      <input class="menu-search-input" id="menuSearch" type="search" placeholder="Search all menu items...">
     </div>
   </div>
 
@@ -1667,7 +1684,7 @@ footer p{font-size:0.78rem;color:var(--text-muted)}
 
 <!-- CART DRAWER -->
 <div class="cart-backdrop" id="cartBackdrop" aria-hidden="true">
-  <aside class="cart-panel" role="dialog" aria-modal="true" aria-labelledby="cartTitle">
+  <aside class="cart-panel" id="cartPanel" role="dialog" aria-modal="true" aria-labelledby="cartTitle">
     <div class="cart-header">
       <div>
         <div class="cart-kicker">Your Order</div>
@@ -1695,7 +1712,7 @@ footer p{font-size:0.78rem;color:var(--text-muted)}
       <div class="summary-total"><span>Total</span><strong id="totalValue">₹0</strong></div>
     </div>
 
-    <div class="checkout-form">
+    <div class="checkout-form" id="checkoutForm">
       <label>
         Customer Name
         <input type="text" id="customerName" placeholder="Enter your name">
@@ -1963,6 +1980,8 @@ const INSTAGRAM_URL = "https://www.instagram.com/coffeabareilly/";
 const GOOGLE_REVIEW_URL = "https://maps.app.goo.gl/vGuap8P7pX28gMB69"; // Temporary: replace with the direct Google review link before publishing.
 const PREPARATION_TIME = "15–20 minutes";
 const ORDER_FOLLOWUP_KEY = "coffeaOrderFollowup";
+const CART_DRAFT_KEY = "coffeaCartDraft";
+const CART_DRAFT_TTL_MS = 90 * 60 * 1000; // 90 minutes of inactivity; survives refresh in this browser tab only
 
 const TABLE_TOKENS = {
   "T1QR92": "T1",
@@ -2168,6 +2187,7 @@ const menuData = [
 ];
 
 const categoryTabs = [
+  { id: "all", label: "All" },
   { id: "best-sellers", label: "Best Sellers" },
   ...menuData.map(category => ({ id: category.id, label: category.label }))
 ];
@@ -2204,21 +2224,144 @@ const moodPicks = [
 ];
 
 
-let activeCategoryId = "best-sellers";
+let activeCategoryId = "all";
 let searchQuery = "";
 let selectedItem = null;
 let selectedAddon = ADDONS[0];
 let cart = [];
 let toastTimer = null;
+let cartDraftExpiresAt = null;
+let cartDraftExpiryTimer = null;
 
 const rupee = (value) => `₹${Number(value).toFixed(2).replace(/\.00$/, "")}`;
 
-function getTableNumber() {
+function getCurrentTableToken() {
   const params = new URLSearchParams(window.location.search);
-  const token = params.get("token")?.trim();
+  return params.get("token")?.trim() || "";
+}
 
+function getTableNumber() {
+  const token = getCurrentTableToken();
   if (!token) return "Not selected";
   return TABLE_TOKENS[token] || "Invalid table QR";
+}
+
+function clearCartDraft() {
+  sessionStorage.removeItem(CART_DRAFT_KEY);
+  cartDraftExpiresAt = null;
+  if (cartDraftExpiryTimer) {
+    clearTimeout(cartDraftExpiryTimer);
+    cartDraftExpiryTimer = null;
+  }
+}
+
+function normaliseCartEntry(entry) {
+  if (!entry || typeof entry !== "object" || !entry.itemId) return null;
+
+  const result = findItem(entry.itemId);
+  if (!result || !result.item.available) return null;
+
+  const addon = result.category.supportsAddons
+    ? (ADDONS.find(option => option.name === entry.addonName) || ADDONS[0])
+    : ADDONS[0];
+
+  const quantity = Math.max(1, Math.min(20, Number.parseInt(entry.quantity, 10) || 1));
+
+  return {
+    key: `${result.item.id}__${addon.name}`,
+    itemId: result.item.id,
+    name: result.item.name,
+    basePrice: result.item.price,
+    addonName: addon.name,
+    addonPrice: addon.price,
+    quantity
+  };
+}
+
+function scheduleCartDraftExpiry(expiresAt) {
+  if (cartDraftExpiryTimer) clearTimeout(cartDraftExpiryTimer);
+
+  const remaining = expiresAt - Date.now();
+  if (remaining <= 0) {
+    cart = [];
+    clearCartDraft();
+    resetCheckoutFields();
+    if (!isPostOrderMode()) {
+      renderCart();
+      showToast("Your cart expired after 90 minutes. Please start a new order.");
+    }
+    return;
+  }
+
+  cartDraftExpiryTimer = setTimeout(() => {
+    cart = [];
+    clearCartDraft();
+    resetCheckoutFields();
+    if (!isPostOrderMode()) {
+      renderCart();
+      showToast("Your cart expired after 90 minutes. Please start a new order.");
+    }
+  }, remaining);
+}
+
+function persistCartDraft(refreshExpiry = true) {
+  if (isPostOrderMode() || cart.length === 0) {
+    clearCartDraft();
+    return;
+  }
+
+  if (refreshExpiry || !Number.isFinite(cartDraftExpiresAt) || cartDraftExpiresAt <= Date.now()) {
+    cartDraftExpiresAt = Date.now() + CART_DRAFT_TTL_MS;
+  }
+
+  const payload = {
+    tableToken: getCurrentTableToken(),
+    expiresAt: cartDraftExpiresAt,
+    cart
+  };
+
+  sessionStorage.setItem(CART_DRAFT_KEY, JSON.stringify(payload));
+  scheduleCartDraftExpiry(cartDraftExpiresAt);
+}
+
+function restoreCartDraft() {
+  let draft;
+  try {
+    draft = JSON.parse(sessionStorage.getItem(CART_DRAFT_KEY) || "null");
+  } catch {
+    clearCartDraft();
+    return;
+  }
+
+  if (!draft) return;
+
+  const currentToken = getCurrentTableToken();
+  const expiresAt = Number(draft.expiresAt);
+
+  // A QR scan for a different table must never inherit a previous table's cart.
+  if ((draft.tableToken || "") !== currentToken || !Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+    clearCartDraft();
+    return;
+  }
+
+  const mergedCart = new Map();
+  (Array.isArray(draft.cart) ? draft.cart : [])
+    .map(normaliseCartEntry)
+    .filter(Boolean)
+    .forEach(entry => {
+      const existing = mergedCart.get(entry.key);
+      if (existing) existing.quantity = Math.min(20, existing.quantity + entry.quantity);
+      else mergedCart.set(entry.key, entry);
+    });
+
+  cart = [...mergedCart.values()];
+  if (cart.length === 0) {
+    clearCartDraft();
+    return;
+  }
+
+  cartDraftExpiresAt = expiresAt;
+  scheduleCartDraftExpiry(expiresAt);
 }
 
 function getAllMenuEntries() {
@@ -2246,9 +2389,11 @@ function itemMatchesSearch(item, category, query) {
 }
 
 function getVisibleEntries() {
-  const entries = activeCategoryId === "best-sellers"
-    ? getAllMenuEntries().filter(({ item }) => item.isBestseller)
-    : (findCategory(activeCategoryId)?.items || []).map(item => ({ item, category: findCategory(activeCategoryId) }));
+  const entries = activeCategoryId === "all"
+    ? getAllMenuEntries()
+    : activeCategoryId === "best-sellers"
+      ? getAllMenuEntries().filter(({ item }) => item.isBestseller)
+      : (findCategory(activeCategoryId)?.items || []).map(item => ({ item, category: findCategory(activeCategoryId) }));
 
   return entries.filter(({ item, category }) => itemMatchesSearch(item, category, searchQuery));
 }
@@ -2448,6 +2593,7 @@ function addSelectedItemToCart() {
   }
 
   closeItemModal();
+  persistCartDraft(true);
   renderCart();
   showToast(`${selectedItem.name} added to cart`);
 }
@@ -2463,11 +2609,25 @@ function calculateCart() {
   return { subtotal, gst, total };
 }
 
+function isPostOrderMode() {
+  return document.getElementById("cartPanel").classList.contains("post-order");
+}
+
+function resetCheckoutFields() {
+  document.getElementById("customerName").value = "";
+  document.getElementById("customerPhone").value = "";
+  document.getElementById("guestCount").value = "";
+  document.getElementById("specialInstructions").value = "";
+  document.getElementById("checkoutError").textContent = "";
+}
+
 function renderCart() {
   const cartItems = document.getElementById("cartItems");
   const cartEmpty = document.getElementById("cartEmpty");
   const cartSummary = document.getElementById("cartSummary");
   const cartCount = document.getElementById("cartCount");
+  const checkoutForm = document.getElementById("checkoutForm");
+  const postOrderMode = isPostOrderMode();
 
   const totalQuantity = cart.reduce((sum, entry) => sum + entry.quantity, 0);
   cartCount.textContent = totalQuantity;
@@ -2503,6 +2663,9 @@ function renderCart() {
     }).join("");
   }
 
+  // Never show customer details or payment information on a fresh empty cart.
+  checkoutForm.style.display = postOrderMode || cart.length > 0 ? "grid" : "none";
+
   const totals = calculateCart();
   document.getElementById("subtotalValue").textContent = rupee(totals.subtotal);
   document.getElementById("gstValue").textContent = rupee(totals.gst);
@@ -2530,7 +2693,25 @@ function updateCart(key, action) {
     cart = cart.filter(entry => entry.key !== key);
   }
 
+  persistCartDraft(true);
   renderCart();
+}
+
+function setPostOrderMode(enabled) {
+  const panel = document.getElementById("cartPanel");
+  const checkoutForm = document.getElementById("checkoutForm");
+  panel.classList.toggle("post-order", enabled);
+  checkoutForm.classList.toggle("followup-mode", enabled);
+  renderCart();
+}
+
+function resetPostOrderState() {
+  sessionStorage.removeItem(ORDER_FOLLOWUP_KEY);
+  cart = [];
+  clearCartDraft();
+  document.getElementById("orderFollowup").classList.remove("show");
+  setPostOrderMode(false);
+  resetCheckoutFields();
 }
 
 function openCart() {
@@ -2539,6 +2720,8 @@ function openCart() {
 }
 
 function closeCart() {
+  // Closing the post-order confirmation starts the next cart as a fresh order.
+  if (isPostOrderMode()) resetPostOrderState();
   document.getElementById("cartBackdrop").classList.remove("open");
   document.getElementById("cartBackdrop").setAttribute("aria-hidden", "true");
 }
@@ -2620,7 +2803,6 @@ ${instructions ? `Special Instructions:\n${instructions}\n\n` : ""}Subtotal: ${r
 GST (5%): ${rupee(totals.gst)}
 Final Total (rounded): ${rupee(totals.total)}
 
-Estimated preparation time: ${PREPARATION_TIME}
 Payment: Cash or UPI — payment may be completed before or after ordering.
 If paying by UPI, I will attach the payment screenshot in this chat.
 
@@ -2634,6 +2816,7 @@ function storeOrderFollowup(order) {
     orderId: order.orderId,
     total: order.total,
     table: order.table,
+    tableToken: getCurrentTableToken(),
     createdAt: Date.now()
   };
   sessionStorage.setItem(ORDER_FOLLOWUP_KEY, JSON.stringify(payload));
@@ -2642,21 +2825,37 @@ function storeOrderFollowup(order) {
 
 function getStoredOrderFollowup() {
   try {
-    return JSON.parse(sessionStorage.getItem(ORDER_FOLLOWUP_KEY) || "null");
+    const followup = JSON.parse(sessionStorage.getItem(ORDER_FOLLOWUP_KEY) || "null");
+    if (!followup) return null;
+
+    // Prevent an old order confirmation from following a customer to another table QR.
+    if ((followup.tableToken || "") !== getCurrentTableToken()) {
+      sessionStorage.removeItem(ORDER_FOLLOWUP_KEY);
+      return null;
+    }
+
+    return followup;
   } catch {
+    sessionStorage.removeItem(ORDER_FOLLOWUP_KEY);
     return null;
   }
 }
 
-function showOrderFollowup() {
+function showOrderFollowup(openCartOnReturn = false) {
   const followup = getStoredOrderFollowup();
   const card = document.getElementById("orderFollowup");
   if (!followup || !card) return;
 
+  // The completed order is intentionally not kept in the new cart.
+  cart = [];
+  clearCartDraft();
   document.getElementById("followupOrderId").textContent = followup.orderId;
   document.getElementById("googleReviewLink").href = GOOGLE_REVIEW_URL;
   document.getElementById("sendPaymentScreenshot").href = `https://wa.me/${WHATSAPP_NUMBER}?text=${encodeURIComponent(`Hi Coffea, I have paid via UPI for Order ID: ${followup.orderId} (Table: ${followup.table}). I am attaching my payment screenshot.`)}`;
   card.classList.add("show");
+  setPostOrderMode(true);
+
+  if (openCartOnReturn) openCart();
 }
 
 function orderOnWhatsApp() {
@@ -2664,10 +2863,14 @@ function orderOnWhatsApp() {
   if (!order) return;
 
   storeOrderFollowup(order);
+  // Clear the cart immediately so a completed order never remains editable locally.
+  cart = [];
+  clearCartDraft();
+  renderCart();
+
   const url = `https://wa.me/${WHATSAPP_NUMBER}?text=${encodeURIComponent(order.message)}`;
   window.open(url, "_blank");
-  showToast("WhatsApp opened. Return here for payment and review details.");
-  window.setTimeout(showOrderFollowup, 250);
+  showToast("WhatsApp opened. Return here to view payment and review details.");
 }
 
 function initializePage() {
@@ -2675,15 +2878,16 @@ function initializePage() {
   document.getElementById("tableValue").textContent = table;
   document.getElementById("cartTableValue").textContent = table;
 
+  restoreCartDraft();
   renderTabs();
   renderMenu();
   renderMoodPicks();
   renderCart();
-  showOrderFollowup();
+  showOrderFollowup(true);
 
-  window.addEventListener("focus", showOrderFollowup);
+  window.addEventListener("focus", () => showOrderFollowup(true));
   document.addEventListener("visibilitychange", () => {
-    if (!document.hidden) showOrderFollowup();
+    if (!document.hidden) showOrderFollowup(true);
   });
 
   document.getElementById("menuSearch").addEventListener("input", (event) => {
